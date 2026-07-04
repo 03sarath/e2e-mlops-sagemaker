@@ -1,4 +1,4 @@
-name: Pipeline 1 - Infra - Create SageMaker Studio
+name: Pipeline 1 - Infra - Create SageMaker Studio v1
 
 on:
   workflow_dispatch:
