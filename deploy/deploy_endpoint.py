@@ -110,43 +110,46 @@ def deploy_model():
         print(f"❌ Model creation error: {str(e)}")
         raise
 
-    # ─── Delete Old Endpoint if Exists, Then Recreate ───────
+    # ─── Check for Existing Endpoint (update, don't recreate) ─
+    endpoint_exists = False
     try:
-        existing = sm_client.describe_endpoint(EndpointName=endpoint_name)
-        endpoint_status = existing["EndpointStatus"]
+        endpoint_status = sm_client.describe_endpoint(
+            EndpointName=endpoint_name
+        )["EndpointStatus"]
         print(f"✅ Endpoint exists : {endpoint_name}")
         print(f"✅ Status          : {endpoint_status}")
 
-        print(f"⏳ Deleting old endpoint...")
-        sm_client.delete_endpoint(EndpointName=endpoint_name)
+        # Wait out any in-flight create/update before deciding
+        while endpoint_status in ["Creating", "Updating",
+                                  "SystemUpdating", "RollingBack"]:
+            print(f"⏳ Endpoint busy ({endpoint_status}), waiting...")
+            time.sleep(30)
+            endpoint_status = sm_client.describe_endpoint(
+                EndpointName=endpoint_name
+            )["EndpointStatus"]
 
-        while True:
-            try:
-                sm_client.describe_endpoint(EndpointName=endpoint_name)
-                time.sleep(10)
-            except sm_client.exceptions.ClientError:
-                break
+        if endpoint_status == "InService":
+            # Healthy endpoint: update in place (managed blue/green,
+            # zero downtime, automatic rollback on failure)
+            endpoint_exists = True
+            print(f"✅ Will update existing endpoint in place")
+        else:
+            # Failed / OutOfService endpoints cannot be updated
+            print(f"⏳ Endpoint status '{endpoint_status}' cannot be "
+                  f"updated, deleting before recreate...")
+            sm_client.delete_endpoint(EndpointName=endpoint_name)
 
-        print(f"✅ Old endpoint deleted")
+            while True:
+                try:
+                    sm_client.describe_endpoint(EndpointName=endpoint_name)
+                    time.sleep(10)
+                except sm_client.exceptions.ClientError:
+                    break
+
+            print(f"✅ Unhealthy endpoint deleted, will create fresh one")
 
     except sm_client.exceptions.ClientError:
-        print(f"⏳ No existing endpoint found, creating fresh one")
-
-    # ─── Clean Up Old Endpoint Configs (avoid clutter) ──────
-    try:
-        configs = sm_client.list_endpoint_configs(
-            NameContains="adult-endpoint-config"
-        )
-        for cfg in configs.get("EndpointConfigs", []):
-            try:
-                sm_client.delete_endpoint_config(
-                    EndpointConfigName=cfg["EndpointConfigName"]
-                )
-                print(f"✅ Deleted old config: {cfg['EndpointConfigName']}")
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"⚠️ Config cleanup skipped: {str(e)}")
+        print(f"⏳ No existing endpoint found, will create fresh one")
 
     # ─── Create Model in SageMaker ──────────────────────────
     model.create(instance_type="ml.m5.large")
@@ -167,32 +170,67 @@ def deploy_model():
     )
     print(f"✅ Endpoint config created : {config_name}")
 
-    # ─── Create Endpoint ─────────────────────────────────────
-    sm_client.create_endpoint(
-        EndpointName=endpoint_name,
-        EndpointConfigName=config_name
-    )
-    print(f"✅ Endpoint creation started!")
+    # ─── Create or Update Endpoint ──────────────────────────
+    if endpoint_exists:
+        sm_client.update_endpoint(
+            EndpointName=endpoint_name,
+            EndpointConfigName=config_name
+        )
+        print(f"✅ Endpoint update started (blue/green, zero downtime)!")
+    else:
+        sm_client.create_endpoint(
+            EndpointName=endpoint_name,
+            EndpointConfigName=config_name
+        )
+        print(f"✅ Endpoint creation started!")
 
     # ─── Wait for Endpoint InService ────────────────────────
     print(f"⏳ Waiting for endpoint to be InService...")
 
     while True:
-        status = sm_client.describe_endpoint(
-            EndpointName=endpoint_name
-        )["EndpointStatus"]
+        detail = sm_client.describe_endpoint(EndpointName=endpoint_name)
+        status = detail["EndpointStatus"]
 
         print(f"   Status: {status}")
 
         if status == "InService":
+            # A failed update rolls back to the old config and returns
+            # InService — verify the new config is actually live
+            if detail["EndpointConfigName"] != config_name:
+                raise Exception(
+                    f"Endpoint update failed and rolled back to previous "
+                    f"config '{detail['EndpointConfigName']}': "
+                    f"{detail.get('FailureReason', 'no reason reported')}"
+                )
             break
         elif status in ["Failed", "OutOfService"]:
-            detail = sm_client.describe_endpoint(EndpointName=endpoint_name)
-            raise Exception(f"Endpoint failed: {detail.get('FailureReason', status)}")
+            raise Exception(
+                f"Endpoint failed: {detail.get('FailureReason', status)}"
+            )
 
         time.sleep(30)
 
     print(f"✅ Endpoint is InService!")
+
+    # ─── Clean Up Old Endpoint Configs (avoid clutter) ──────
+    # Runs only after the new config is live; never deletes the
+    # config currently serving traffic
+    try:
+        configs = sm_client.list_endpoint_configs(
+            NameContains="adult-endpoint-config"
+        )
+        for cfg in configs.get("EndpointConfigs", []):
+            if cfg["EndpointConfigName"] == config_name:
+                continue
+            try:
+                sm_client.delete_endpoint_config(
+                    EndpointConfigName=cfg["EndpointConfigName"]
+                )
+                print(f"✅ Deleted old config: {cfg['EndpointConfigName']}")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"⚠️ Config cleanup skipped: {str(e)}")
 
     # ─── Test Endpoint ───────────────────────────────────────
     print(f"\n⏳ Testing endpoint...")
